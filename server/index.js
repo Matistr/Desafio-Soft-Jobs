@@ -40,16 +40,22 @@ const express = require('express')
 const cors = require('cors')
 const bcrypt = require('bcryptjs')
 const jwt = require('jsonwebtoken')
+const crypto = require('crypto')
 
 const pool = require('./db')
 const { requestLogger, checkCredentials, verifyToken } = require('./middlewares')
+
+// Ensure users table has a column for per-user jwt secret
+pool.query('ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS jwt_secret VARCHAR(200);')
+  .then(() => console.log('Ensured usuarios.jwt_secret column exists'))
+  .catch(err => console.warn('Could not ensure jwt_secret column:', err && err.message ? err.message : err))
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 app.use(requestLogger)
 
-//Nuevo Usuario
+// Nuevo Usuario
 app.post('/usuarios', checkCredentials, async (req, res, next) => {
   try {
     const { email, password, rol = null, lenguage = null } = req.body
@@ -58,12 +64,15 @@ app.post('/usuarios', checkCredentials, async (req, res, next) => {
     if (existing.length) return res.status(409).json({ message: 'El email ya está registrado.' })
 
     const hashed = await bcrypt.hash(password, 10)
+    const userSecret = crypto.randomBytes(32).toString('hex')
     const { rows } = await pool.query(
-      'INSERT INTO usuarios (email, password, rol, lenguage) VALUES ($1, $2, $3, $4) RETURNING id, email, rol, lenguage',
-      [email, hashed, rol, lenguage]
+      'INSERT INTO usuarios (email, password, rol, lenguage, jwt_secret) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, rol, lenguage',
+      [email, hashed, rol, lenguage, userSecret]
     )
 
-    res.status(201).json(rows[0])
+    // Create JWT signed with the per-user secret and return it alongside the user
+    const token = jwt.sign({ email: rows[0].email }, userSecret, { expiresIn: '1h' })
+    res.status(201).json({ user: rows[0], token })
   } catch (err) {
     next(err)
   }
@@ -80,7 +89,8 @@ app.post('/login', checkCredentials, async (req, res, next) => {
     const isValid = await bcrypt.compare(password, user.password)
     if (!isValid) return res.status(401).json({ message: 'Credenciales incorrectas.' })
 
-    const token = jwt.sign({ email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '1h' })
+    const userSecret = user.jwt_secret || crypto.randomBytes(32).toString('hex')
+    const token = jwt.sign({ email: user.email }, userSecret, { expiresIn: '1h' })
     res.json({ token })
   } catch (err) {
     next(err)
